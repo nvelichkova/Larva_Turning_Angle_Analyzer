@@ -1,6 +1,7 @@
 # Larva Turning Angle Analyzer
 
 PyQt5 application for analyzing *Drosophila* larva locomotion from video microscopy.
+![Application Screenshot](images/Capture.PNG)
 
 ## Installation
 ```bash
