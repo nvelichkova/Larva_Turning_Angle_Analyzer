@@ -6,6 +6,7 @@ Analyzes turning angles of Drosophila larvae from ImageJ ROI files
 import sys
 import os
 import glob
+
 import re
 import numpy as np
 import cv2
@@ -22,6 +23,7 @@ import pandas as pd
 from scipy import ndimage
 from scipy.interpolate import splprep, splev
 from skimage import measure
+from skimage.morphology import skeletonize as _skeletonize
 import zipfile
 import struct
 
@@ -158,11 +160,24 @@ class LarvaTurningAnalyzer(QMainWindow):
         auto_roi_btn.clicked.connect(self.show_auto_detect_roi_dialog)
         file_layout.addWidget(auto_roi_btn)
         
-        # Save drawn ROIs button
-        save_roi_btn = QPushButton("💾 Save Drawn ROIs")
-        save_roi_btn.setToolTip("Save drawn ROIs to ImageJ-compatible .roi files")
+        # Save ROIs button (drawn or auto-detected)
+        save_roi_btn = QPushButton("💾 Save ROIs")
+        save_roi_btn.setToolTip(
+            "Save all ROIs (drawn or auto-detected) to a ZIP of ImageJ .roi files.\n"
+            "Compatible with the colab prediction pipeline.")
         save_roi_btn.clicked.connect(self.save_drawn_rois)
         file_layout.addWidget(save_roi_btn)
+
+        # Clear ROI buttons
+        clear_frame_btn = QPushButton("🗑 Clear ROI (this frame)")
+        clear_frame_btn.setToolTip("Remove auto-detected or drawn ROI for the current frame only")
+        clear_frame_btn.clicked.connect(self.clear_roi_current_frame)
+        file_layout.addWidget(clear_frame_btn)
+
+        clear_all_btn = QPushButton("🗑 Clear All ROIs")
+        clear_all_btn.setToolTip("Remove all auto-detected or drawn ROIs (keeps loaded ROI files)")
+        clear_all_btn.clicked.connect(self.clear_roi_all)
+        file_layout.addWidget(clear_all_btn)
         
         self.file_status_label = QLabel("No files loaded")
         self.file_status_label.setWordWrap(True)
@@ -1026,35 +1041,125 @@ class LarvaTurningAnalyzer(QMainWindow):
         self.draw_roi_btn.setText("✏️ Draw ROI")
         self.update_display()
     
+    def clear_roi_current_frame(self):
+        """Remove ROI for the current frame only."""
+        if not self.rois:
+            QMessageBox.information(self, "No ROIs", "No ROIs loaded.")
+            return
+        roi_index = self.current_frame + (self.roi_offset_spinbox.value()
+                                          if hasattr(self, 'roi_offset_spinbox') else 0)
+        if 0 <= roi_index < len(self.rois) and self.rois[roi_index] is not None:
+            self.rois[roi_index] = None
+            self.update_file_status()
+            self.update_display()
+            QMessageBox.information(self, "Cleared",
+                                    f"ROI cleared for frame {self.current_frame}.")
+        else:
+            QMessageBox.information(self, "No ROI",
+                                    f"No ROI found for frame {self.current_frame}.")
+
+    def clear_roi_all(self):
+        """Remove all in-memory ROIs (does not delete loaded files)."""
+        if not self.rois or all(r is None for r in self.rois):
+            QMessageBox.information(self, "No ROIs", "No ROIs to clear.")
+            return
+        reply = QMessageBox.question(
+            self, "Clear All ROIs",
+            ("Clear all " + str(sum(r is not None for r in self.rois)) + " ROIs?\n\nThis does not delete any files on disk."),
+            QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            n = len(self.rois)
+            self.rois = [None] * n
+            self.roi_path = None
+            self.update_file_status()
+            self.update_display()
+            QMessageBox.information(self, "Cleared", "All ROIs cleared.")
+
     def save_drawn_rois(self):
-        """Save drawn ROIs to ImageJ-compatible .roi files"""
-        if len(self.rois) == 0:
+        """Save all ROIs to a ZIP of ImageJ .roi files (colab-compatible naming)."""
+        if not self.rois or all(r is None for r in self.rois):
             QMessageBox.warning(self, "No ROIs", "No ROIs to save!")
             return
-        
-        # Ask for save location
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select Folder to Save ROI Files"
+
+        from PyQt5.QtWidgets import QFileDialog
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save ROIs as ZIP",
+            "predicted_rois.zip",
+            "ZIP archives (*.zip);;All files (*)"
         )
-        
-        if not folder:
+        if not save_path:
             return
-        
-        # Save each ROI as a separate .roi file
+
+        import zipfile as _zf
         saved_count = 0
-        for frame_idx, roi in enumerate(self.rois):
-            if roi is not None and len(roi) > 0:
-                filename = os.path.join(folder, f"roi_{frame_idx:04d}.roi")
-                self.write_roi_file(filename, roi)
+        with _zf.ZipFile(save_path, 'w', _zf.ZIP_DEFLATED) as zf:
+            for frame_idx, roi in enumerate(self.rois):
+                if roi is None or len(roi) == 0:
+                    continue
+                # Naming matches the colab export: "Object ROI - Slice NNNN.roi"
+                roi_name = f"Object ROI - Slice {frame_idx + 1:04d}.roi"
+                roi_bytes = self._roi_to_bytes(roi)
+                zf.writestr(roi_name, roi_bytes)
                 saved_count += 1
-        
+
         QMessageBox.information(
-            self,
-            "ROIs Saved",
-            f"Successfully saved {saved_count} ROI files to:\n{folder}\n\n"
-            "These files are compatible with ImageJ."
+            self, "ROIs Saved",
+            f"✓ Saved {saved_count} ROI files to:\n{save_path}\n\n"
+            "Compatible with ImageJ and the Colab prediction pipeline.\n"
+            "Load in ImageJ via  Plugins → ROI Manager → Open."
         )
     
+    def _roi_to_bytes(self, roi_points):
+        """
+        Serialize ROI points to an ImageJ .roi binary blob (polygon type).
+        Matches the format produced by roifile.ImagejRoi.frompoints() in the
+        Colab notebook, so the ZIP can be loaded by the Colab pipeline and by
+        ImageJ ROI Manager.
+        """
+        import struct as _st
+        pts     = np.asarray(roi_points, dtype=np.float32)
+        n       = len(pts)
+        left    = int(pts[:, 0].min())
+        top     = int(pts[:, 1].min())
+        right   = int(pts[:, 0].max())
+        bottom  = int(pts[:, 1].max())
+
+        buf = bytearray()
+        buf += b'Iout'                           # magic
+        buf += _st.pack('>h', 228)               # version
+        buf += _st.pack('>b', 0)                 # type = polygon
+        buf += _st.pack('>b', 0)                 # padding
+        buf += _st.pack('>h', top)
+        buf += _st.pack('>h', left)
+        buf += _st.pack('>h', bottom)
+        buf += _st.pack('>h', right)
+        buf += _st.pack('>h', n)                 # n_coordinates
+        buf += _st.pack('>f', 0.0)               # x1
+        buf += _st.pack('>f', 0.0)               # y1
+        buf += _st.pack('>f', 0.0)               # x2
+        buf += _st.pack('>f', 0.0)               # y2
+        buf += _st.pack('>h', 0)                 # stroke_width
+        buf += _st.pack('>h', 0)                 # shape_roi_size
+        buf += _st.pack('>i', 0)                 # stroke_color
+        buf += _st.pack('>i', 0)                 # fill_color
+        buf += _st.pack('>h', 0)                 # subtype
+        buf += _st.pack('>h', 0)                 # options
+        buf += _st.pack('>b', 0)                 # arrow_style
+        buf += _st.pack('>b', 0)                 # arrow_head_size
+        buf += _st.pack('>h', 0)                 # rounded_rect_arc_size
+        buf += _st.pack('>i', 0)                 # position
+        buf += _st.pack('>i', 64)                # header2_offset
+        # Pad to 64 bytes
+        while len(buf) < 64:
+            buf += b'\x00'
+        # X offsets from left
+        for pt in pts:
+            buf += _st.pack('>h', int(round(pt[0])) - left)
+        # Y offsets from top
+        for pt in pts:
+            buf += _st.pack('>h', int(round(pt[1])) - top)
+        return bytes(buf)
+
     def write_roi_file(self, filepath, roi_points):
         """Write ROI points to ImageJ-compatible .roi file format"""
         # Simplified ImageJ ROI format writer (polygon type)
@@ -1112,201 +1217,88 @@ class LarvaTurningAnalyzer(QMainWindow):
                 f.write(struct.pack('>h', y))
     
     def show_auto_detect_roi_dialog(self):
-        """Show dialog for auto-detecting ROI with parameters"""
-        from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QSlider, QRadioButton, QButtonGroup
-        
-        # Create dialog
+        """Show dialog for auto-detecting ROI using the colab-grade pipeline."""
+        from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QRadioButton, QButtonGroup
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Auto-detect ROI")
-        dialog.setMinimumWidth(400)
-        
+        dialog.setMinimumWidth(420)
         layout = QVBoxLayout()
-        
-        # Instructions
+
         info_label = QLabel(
-            "Automatically detect larva outline using threshold.\n\n"
-            "Adjust parameters and preview the result:"
+            "<b>Colab-grade body-outline detection</b><br><br>"
+            "Uses the same multi-candidate Otsu pipeline as the Colab "
+            "training notebook:<br>"
+            "• Inverted grey-channel Otsu + morphological fill<br>"
+            "• Scores candidates by skeleton branch count + over-fill<br>"
+            "• Convexity guard (≥ 0.75) catches gut-loop masks<br>"
+            "• Green-channel fallback, then convex-hull fallback<br><br>"
+            "No manual threshold tuning needed."
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
-        
-        # Threshold method
-        method_group = QGroupBox("Threshold Method")
-        method_layout = QVBoxLayout()
-        
-        self.thresh_method_group = QButtonGroup()
-        
-        otsu_radio = QRadioButton("Otsu (automatic)")
-        otsu_radio.setToolTip("Automatic threshold based on image histogram")
-        otsu_radio.setChecked(True)
-        self.thresh_method_group.addButton(otsu_radio, 0)
-        method_layout.addWidget(otsu_radio)
-        
-        manual_radio = QRadioButton("Manual threshold")
-        manual_radio.setToolTip("Set threshold value manually")
-        self.thresh_method_group.addButton(manual_radio, 1)
-        method_layout.addWidget(manual_radio)
-        
-        method_group.setLayout(method_layout)
-        layout.addWidget(method_group)
-        
-        # Manual threshold slider
-        thresh_group = QGroupBox("Manual Threshold Value")
-        thresh_layout = QVBoxLayout()
-        
-        self.thresh_slider = QSlider(Qt.Horizontal)
-        self.thresh_slider.setMinimum(0)
-        self.thresh_slider.setMaximum(255)
-        self.thresh_slider.setValue(128)
-        self.thresh_slider.setEnabled(False)
-        thresh_layout.addWidget(self.thresh_slider)
-        
-        self.thresh_value_label = QLabel("Value: 128")
-        thresh_layout.addWidget(self.thresh_value_label)
-        
-        thresh_group.setLayout(thresh_layout)
-        layout.addWidget(thresh_group)
-        
-        # Enable slider when manual is selected
-        def on_method_changed():
-            is_manual = self.thresh_method_group.checkedId() == 1
-            self.thresh_slider.setEnabled(is_manual)
-        
-        self.thresh_method_group.buttonClicked.connect(on_method_changed)
-        
-        # Update label when slider moves
-        def on_slider_changed(value):
-            self.thresh_value_label.setText(f"Value: {value}")
-        
-        self.thresh_slider.valueChanged.connect(on_slider_changed)
-        
-        # Invert option
-        self.invert_checkbox = QCheckBox("Invert (for dark larvae on bright background)")
-        self.invert_checkbox.setChecked(False)
-        layout.addWidget(self.invert_checkbox)
-        
-        # Min/max size filters
-        size_group = QGroupBox("Size Filters")
+
+        # Size filters (still useful for multi-animal images)
+        size_group = QGroupBox("Size Filters  (optional — leave defaults for single larva)")
         size_layout = QVBoxLayout()
-        
-        min_size_layout = QHBoxLayout()
-        min_size_layout.addWidget(QLabel("Min area (pixels²):"))
+
+        min_size_row = QHBoxLayout()
+        min_size_row.addWidget(QLabel("Min area (px²):"))
         self.min_size_spinbox = QSpinBox()
-        self.min_size_spinbox.setMinimum(0)
-        self.min_size_spinbox.setMaximum(1000000)
+        self.min_size_spinbox.setRange(0, 2000000)
         self.min_size_spinbox.setValue(500)
-        self.min_size_spinbox.setToolTip("Ignore contours smaller than this")
-        min_size_layout.addWidget(self.min_size_spinbox)
-        size_layout.addLayout(min_size_layout)
-        
-        max_size_layout = QHBoxLayout()
-        max_size_layout.addWidget(QLabel("Max area (pixels²):"))
+        self.min_size_spinbox.setToolTip("Ignore contours smaller than this (0 = no limit)")
+        min_size_row.addWidget(self.min_size_spinbox)
+        size_layout.addLayout(min_size_row)
+
+        max_size_row = QHBoxLayout()
+        max_size_row.addWidget(QLabel("Max area (px²):"))
         self.max_size_spinbox = QSpinBox()
-        self.max_size_spinbox.setMinimum(0)
-        self.max_size_spinbox.setMaximum(1000000)
-        self.max_size_spinbox.setValue(100000)
-        self.max_size_spinbox.setToolTip("Ignore contours larger than this")
-        max_size_layout.addWidget(self.max_size_spinbox)
-        size_layout.addLayout(max_size_layout)
-        
+        self.max_size_spinbox.setRange(0, 2000000)
+        self.max_size_spinbox.setValue(500000)
+        self.max_size_spinbox.setToolTip("Ignore contours larger than this (0 = no limit)")
+        max_size_row.addWidget(self.max_size_spinbox)
+        size_layout.addLayout(max_size_row)
+
         size_group.setLayout(size_layout)
         layout.addWidget(size_group)
-        
-        # NEW: Preprocessing options for difficult images
-        preprocess_group = QGroupBox("Preprocessing (for low-contrast images)")
-        preprocess_layout = QVBoxLayout()
-        
-        self.enhance_contrast_checkbox = QCheckBox("✓ Enhance contrast (CLAHE)")
-        self.enhance_contrast_checkbox.setChecked(True)
-        self.enhance_contrast_checkbox.setToolTip("Improves detection for low-contrast images\nRECOMMENDED for difficult images")
-        preprocess_layout.addWidget(self.enhance_contrast_checkbox)
-        
-        self.use_adaptive_checkbox = QCheckBox("Use adaptive threshold (for varying lighting)")
-        self.use_adaptive_checkbox.setChecked(False)
-        self.use_adaptive_checkbox.setToolTip("Better for images with uneven illumination\nOverrides Otsu/Manual")
-        preprocess_layout.addWidget(self.use_adaptive_checkbox)
-        
-        blur_layout = QHBoxLayout()
-        blur_layout.addWidget(QLabel("Blur amount:"))
-        self.blur_slider = QSlider(Qt.Horizontal)
-        self.blur_slider.setMinimum(0)
-        self.blur_slider.setMaximum(50)
-        self.blur_slider.setValue(20)  # 2.0 sigma
-        self.blur_slider.setToolTip("Reduces noise before detection\nHigher = more blur")
-        blur_layout.addWidget(self.blur_slider)
-        self.blur_value_label = QLabel("2.0")
-        blur_layout.addWidget(self.blur_value_label)
-        preprocess_layout.addLayout(blur_layout)
-        
-        def on_blur_changed(value):
-            sigma = value / 10.0
-            self.blur_value_label.setText(f"{sigma:.1f}")
-        
-        self.blur_slider.valueChanged.connect(on_blur_changed)
-        
-        preprocess_group.setLayout(preprocess_layout)
-        layout.addWidget(preprocess_group)
-        
-        # Preview button
+
+        # Preview
         preview_btn = QPushButton("🔍 Preview on Current Frame")
         preview_btn.clicked.connect(lambda: self.preview_auto_detect_roi(
-            self.thresh_method_group.checkedId() == 0,  # use_otsu
-            self.thresh_slider.value(),
-            self.invert_checkbox.isChecked(),
+            True, 128, False,
             self.min_size_spinbox.value(),
-            self.max_size_spinbox.value(),
-            self.enhance_contrast_checkbox.isChecked(),
-            self.blur_slider.value() / 10.0,
-            self.use_adaptive_checkbox.isChecked()
+            self.max_size_spinbox.value()
         ))
         layout.addWidget(preview_btn)
-        
-        # Apply to options
+
+        # Apply-to
         apply_group = QGroupBox("Apply To")
         apply_layout = QVBoxLayout()
-        
         self.apply_mode_group = QButtonGroup()
-        
         current_radio = QRadioButton("Current frame only")
         current_radio.setChecked(True)
         self.apply_mode_group.addButton(current_radio, 0)
         apply_layout.addWidget(current_radio)
-        
-        all_radio = QRadioButton("All frames (batch mode)")
-        all_radio.setToolTip("Detect ROI for all frames in video")
+        all_radio = QRadioButton("All frames (batch)")
         self.apply_mode_group.addButton(all_radio, 1)
         apply_layout.addWidget(all_radio)
-        
         apply_group.setLayout(apply_layout)
         layout.addWidget(apply_group)
-        
-        # Dialog buttons
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(dialog.accept)
-        button_box.rejected.connect(dialog.reject)
-        layout.addWidget(button_box)
-        
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dialog.accept)
+        btn_box.rejected.connect(dialog.reject)
+        layout.addWidget(btn_box)
         dialog.setLayout(layout)
-        
-        # Show dialog
+
         if dialog.exec_() == QDialog.Accepted:
-            # Apply auto-detection
-            use_otsu = self.thresh_method_group.checkedId() == 0
-            thresh_value = self.thresh_slider.value()
-            invert = self.invert_checkbox.isChecked()
             min_size = self.min_size_spinbox.value()
             max_size = self.max_size_spinbox.value()
-            enhance_contrast = self.enhance_contrast_checkbox.isChecked()
-            blur_sigma = self.blur_slider.value() / 10.0
-            use_adaptive = self.use_adaptive_checkbox.isChecked()
-            apply_to_all = self.apply_mode_group.checkedId() == 1
-            
-            if apply_to_all:
-                self.auto_detect_roi_batch(use_otsu, thresh_value, invert, min_size, max_size,
-                                          enhance_contrast, blur_sigma, use_adaptive)
+            if self.apply_mode_group.checkedId() == 1:
+                self.auto_detect_roi_batch(True, 128, False, min_size, max_size)
             else:
-                self.auto_detect_roi_single(use_otsu, thresh_value, invert, min_size, max_size,
-                                           enhance_contrast, blur_sigma, use_adaptive)
+                self.auto_detect_roi_single(True, 128, False, min_size, max_size)
     
     def preview_auto_detect_roi(self, use_otsu, thresh_value, invert, min_size, max_size,
                                  enhance_contrast=True, blur_sigma=2.0, use_adaptive=False):
@@ -1362,115 +1354,157 @@ class LarvaTurningAnalyzer(QMainWindow):
             "Otherwise, adjust parameters and preview again."
         )
     
-    def detect_roi_from_threshold(self, frame, use_otsu, thresh_value, invert, min_size, max_size, 
-                                   enhance_contrast=True, blur_sigma=2.0, use_adaptive=False):
-        """Detect ROI contour from image using threshold with enhanced preprocessing"""
-        # Convert to grayscale
-        if len(frame.shape) == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # ── Colab-grade masking helpers ──────────────────────────────────────────
+
+    def _roi_base_otsu(self, gray):
+        """Otsu on inverted grey image (larva is darker than background)."""
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, mask  = cv2.threshold(blurred, 0, 255,
+                                 cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        k9   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k9, iterations=3)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k9, iterations=1)
+        return mask
+
+    def _roi_base_otsu_green(self, img_bgr):
+        """Fallback: threshold on green channel (larvae slightly greenish)."""
+        green   = img_bgr[:, :, 1] if img_bgr.ndim == 3 else img_bgr
+        blurred = cv2.GaussianBlur(green, (5, 5), 0)
+        _, mask = cv2.threshold(blurred, 0, 255,
+                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        k9   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k9, iterations=3)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k9, iterations=1)
+        return mask
+
+    def _roi_apply_close_fill(self, base, ksize, iters):
+        k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        m  = cv2.morphologyEx(base, cv2.MORPH_CLOSE, k2, iterations=iters)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            out = np.zeros_like(m)
+            cv2.drawContours(out, [max(cnts, key=cv2.contourArea)], -1, 255, -1)
+            return out
+        return m
+
+    def _roi_branch_count(self, mask):
+        sk   = _skeletonize(mask > 0).astype(np.float32)
+        nbrs = cv2.filter2D(sk, -1, np.ones((3, 3), np.float32)) - sk
+        return int(np.sum((sk > 0) & (nbrs >= 3)))
+
+    def _roi_convexity_ratio(self, mask):
+        """Area / convex-hull-area.  Clean larva body >= 0.75."""
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return 0.0
+        cnt       = max(cnts, key=cv2.contourArea)
+        hull      = cv2.convexHull(cnt)
+        hull_area = float(cv2.contourArea(hull))
+        if hull_area < 1.0:
+            return 0.0
+        return float(cv2.contourArea(cnt)) / hull_area
+
+    def _roi_convex_hull_mask(self, mask):
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return mask
+        cnt  = max(cnts, key=cv2.contourArea)
+        hull = cv2.convexHull(cnt)
+        out  = np.zeros_like(mask)
+        cv2.fillPoly(out, [hull], 255)
+        return out
+
+    def _roi_best_mask_from_base(self, base):
+        base_area  = max(float(np.sum(base > 0)), 1.0)
+        candidates = [(13,1),(17,1),(21,1),(25,1),(25,2),
+                      (31,1),(31,2),(41,1),(41,2),(51,1)]
+        best_mask, best_score = None, 1e9
+        for ksize, iters in candidates:
+            m = self._roi_apply_close_fill(base.copy(), ksize, iters)
+            if np.sum(m > 0) < 500:
+                continue
+            branches = self._roi_branch_count(m)
+            overfill = (float(np.sum(m > 0)) - base_area) / base_area
+            score    = branches * 1000 + overfill * 100
+            if score < best_score:
+                best_score = score
+                best_mask  = m
+            if branches == 0 and overfill < 0.12:
+                break
+        return best_mask if best_mask is not None else base
+
+    def detect_roi_from_threshold(self, frame, use_otsu=True, thresh_value=128,
+                                   invert=False, min_size=500, max_size=100000,
+                                   enhance_contrast=True, blur_sigma=2.0,
+                                   use_adaptive=False):
+        """
+        Detect the larva body contour using the same multi-candidate Otsu
+        pipeline as the Colab notebook (v9/v10).
+
+        The old parameters (use_otsu, thresh_value, invert, enhance_contrast,
+        blur_sigma, use_adaptive) are kept for backward compatibility but are
+        no longer used — the new pipeline selects its own optimal threshold
+        automatically.  min_size / max_size are still honoured as a final
+        area filter.
+
+        Pipeline:
+          1. Otsu on inverted grey (larva darker than background)
+          2. Multi-candidate morphological closing — picks the candidate whose
+             skeleton has fewest branch points and least over-fill
+          3. Convexity-ratio guard (>= 0.75): if the best grey mask looks like
+             gut loops rather than a body outline, try the green channel next
+          4. Final fallback: filled convex hull of the largest contour
+          5. Optional area filter (min_size / max_size)
+          6. Returns the largest-contour points as an (N, 2) array
+        """
+        CONVEXITY_THRESHOLD = 0.75
+
+        # Ensure BGR
+        if frame.ndim == 2:
+            img_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.shape[2] == 4:
+            img_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
         else:
-            gray = frame.copy()
-        
-        # ENHANCEMENT 1: Contrast enhancement for low-contrast images
-        if enhance_contrast:
-            # Use CLAHE (Contrast Limited Adaptive Histogram Equalization)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            gray = clahe.apply(gray)
-        
-        # ENHANCEMENT 2: Gaussian blur to reduce noise
-        if blur_sigma > 0:
-            gray = cv2.GaussianBlur(gray, (5, 5), blur_sigma)
-        
-        # Apply threshold
-        if use_adaptive:
-            # ENHANCEMENT 3: Adaptive threshold for varying lighting
-            binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                          cv2.THRESH_BINARY, 11, 2)
-        elif use_otsu:
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            img_bgr = frame.copy()
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        # --- Primary: grey Otsu ---
+        base      = self._roi_base_otsu(gray)
+        best_mask = self._roi_best_mask_from_base(base)
+
+        if best_mask is not None and self._roi_convexity_ratio(best_mask) >= CONVEXITY_THRESHOLD:
+            mask = best_mask
         else:
-            _, binary = cv2.threshold(gray, thresh_value, 255, cv2.THRESH_BINARY)
-        
-        # Invert if needed
-        if invert:
-            binary = cv2.bitwise_not(binary)
-        
-        # ENHANCEMENT 4: More aggressive morphology for difficult images
-        # Increased kernel size and iterations for smoother results
-        kernel = np.ones((7,7), np.uint8)  # Larger kernel (was 5x5)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=4)  # More iterations (was 3)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=3)   # More iterations (was 2)
-        
-        # Fill holes in the binary image
-        contours_fill, _ = cv2.findContours(binary.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours_fill:
-            cv2.drawContours(binary, [cnt], 0, 255, -1)
-        
-        # Find contours
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if len(contours) == 0:
+            # --- Fallback 1: green channel ---
+            base_g = self._roi_base_otsu_green(img_bgr)
+            mask_g = self._roi_best_mask_from_base(base_g)
+            if mask_g is not None and self._roi_convexity_ratio(mask_g) >= CONVEXITY_THRESHOLD:
+                mask = mask_g
+            else:
+                # --- Fallback 2: convex hull ---
+                src_mask = best_mask if best_mask is not None else (
+                           mask_g   if mask_g   is not None else base)
+                mask = self._roi_convex_hull_mask(src_mask)
+
+        # Area filter
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
             return None
-        
-        # Filter by size and find largest valid contour
-        valid_contours = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if min_size <= area <= max_size:
-                valid_contours.append(contour)
-        
-        if len(valid_contours) == 0:
-            return None
-        
-        # Get largest valid contour
-        largest_contour = max(valid_contours, key=cv2.contourArea)
-        
-        # ENHANCEMENT: Apply contour smoothing
-        # Smooth the contour points using convolution
-        if len(largest_contour) > 10:
-            # Convert to simple array format
-            contour_points = largest_contour.squeeze()
-            
-            # Apply moving average smoothing
-            window_size = 5  # Smooth over 5 neighboring points
-            kernel = np.ones(window_size) / window_size
-            
-            # Smooth x and y coordinates separately
-            x_smooth = np.convolve(contour_points[:, 0], kernel, mode='same')
-            y_smooth = np.convolve(contour_points[:, 1], kernel, mode='same')
-            
-            # Handle boundary conditions (wrap around for closed contour)
-            if window_size > 1:
-                half_window = window_size // 2
-                # Re-smooth the boundaries by wrapping
-                x_coords = np.concatenate([contour_points[-half_window:, 0], 
-                                          contour_points[:, 0], 
-                                          contour_points[:half_window, 0]])
-                y_coords = np.concatenate([contour_points[-half_window:, 1], 
-                                          contour_points[:, 1], 
-                                          contour_points[:half_window, 1]])
-                
-                x_smooth = np.convolve(x_coords, kernel, mode='valid')
-                y_smooth = np.convolve(y_coords, kernel, mode='valid')
-            
-            # Reconstruct contour
-            largest_contour = np.column_stack([x_smooth, y_smooth]).astype(np.int32)
-            largest_contour = largest_contour.reshape(-1, 1, 2)
-        
-        # Simplify contour (reduce points while maintaining shape)
-        # Increased epsilon for smoother outline (was 0.002)
-        epsilon = 0.010 * cv2.arcLength(largest_contour, True)  # Increased from 0.008
-        approx = cv2.approxPolyDP(largest_contour, epsilon, True)
-        
-        # Convert to expected format (N, 2)
-        roi_points = approx.squeeze()
-        
-        # Ensure 2D array
-        if len(roi_points.shape) == 1:
+        valid = [c for c in cnts
+                 if min_size <= cv2.contourArea(c) <= max_size]
+        if not valid:
+            # Relax filter — return largest regardless
+            valid = cnts
+        largest = max(valid, key=cv2.contourArea)
+
+        roi_points = largest.squeeze()
+        if roi_points.ndim == 1:
             roi_points = roi_points.reshape(-1, 2)
-        
-        return roi_points
-    
+        if len(roi_points) < 3:
+            return None
+        return roi_points.astype(np.int32)
+
     def auto_detect_roi_single(self, use_otsu, thresh_value, invert, min_size, max_size,
                                 enhance_contrast=True, blur_sigma=2.0, use_adaptive=False):
         """Auto-detect ROI for current frame"""
