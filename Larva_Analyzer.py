@@ -1356,11 +1356,16 @@ class LarvaTurningAnalyzer(QMainWindow):
     
     # ── Colab-grade masking helpers ──────────────────────────────────────────
 
-    def _roi_base_otsu(self, gray):
-        """Otsu on inverted grey image (larva is darker than background)."""
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    def _roi_base_otsu(self, img):
+        """Otsu on inverted grey image (larva is darker than background).
+        Accepts either a BGR colour image or an already-greyscale image."""
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(img, (5, 5), 0)
         _, mask  = cv2.threshold(blurred, 0, 255,
                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        from scipy import ndimage as _ndi
+        mask = (_ndi.binary_fill_holes(mask > 0).astype(np.uint8)) * 255
         k9   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k9, iterations=3)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k9, iterations=1)
@@ -1372,19 +1377,39 @@ class LarvaTurningAnalyzer(QMainWindow):
         blurred = cv2.GaussianBlur(green, (5, 5), 0)
         _, mask = cv2.threshold(blurred, 0, 255,
                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        from scipy import ndimage as _ndi
+        mask = (_ndi.binary_fill_holes(mask > 0).astype(np.uint8)) * 255
         k9   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k9, iterations=3)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k9, iterations=1)
         return mask
 
     def _roi_apply_close_fill(self, base, ksize, iters):
-        k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-        m  = cv2.morphologyEx(base, cv2.MORPH_CLOSE, k2, iterations=iters)
+        # Border-safe closing: pad before morphology, crop after.
+        # Prevents large kernels from expanding the mask to the image border
+        # when the real larva has a small gap from the edge.
+        pad = ksize // 2 + 1
+        m_padded = cv2.copyMakeBorder(base, pad, pad, pad, pad,
+                                      cv2.BORDER_CONSTANT, value=0)
+        k2       = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        m_padded = cv2.morphologyEx(m_padded, cv2.MORPH_CLOSE, k2, iterations=iters)
+        h, w     = base.shape
+        m        = m_padded[pad:pad+h, pad:pad+w]
+
+        # Stage 1: fill external contours >=15% of largest
         cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
-            out = np.zeros_like(m)
-            cv2.drawContours(out, [max(cnts, key=cv2.contourArea)], -1, 255, -1)
-            return out
+            out      = np.zeros_like(m)
+            max_area = cv2.contourArea(max(cnts, key=cv2.contourArea))
+            min_area = max(500, max_area * 0.15)
+            for cnt in cnts:
+                if cv2.contourArea(cnt) >= min_area:
+                    cv2.drawContours(out, [cnt], -1, 255, -1)
+            m = out
+        # Stage 2: fill interior holes (C/U concave bay)
+        cnts_all, _ = cv2.findContours(m.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in cnts_all:
+            cv2.drawContours(m, [cnt], 0, 255, -1)
         return m
 
     def _roi_branch_count(self, mask):
@@ -1415,23 +1440,41 @@ class LarvaTurningAnalyzer(QMainWindow):
         return out
 
     def _roi_best_mask_from_base(self, base):
+        """Pick largest morphological candidate with <= 4 skeleton branches."""
         base_area  = max(float(np.sum(base > 0)), 1.0)
         candidates = [(13,1),(17,1),(21,1),(25,1),(25,2),
                       (31,1),(31,2),(41,1),(41,2),(51,1)]
-        best_mask, best_score = None, 1e9
+        acceptable = []
+        best_fallback, best_area_fb = None, 0.0
         for ksize, iters in candidates:
             m = self._roi_apply_close_fill(base.copy(), ksize, iters)
-            if np.sum(m > 0) < 500:
+            area = float(np.sum(m > 0))
+            if area < 500:
                 continue
             branches = self._roi_branch_count(m)
-            overfill = (float(np.sum(m > 0)) - base_area) / base_area
-            score    = branches * 1000 + overfill * 100
-            if score < best_score:
-                best_score = score
-                best_mask  = m
-            if branches == 0 and overfill < 0.12:
-                break
-        return best_mask if best_mask is not None else base
+            if branches <= 4:
+                acceptable.append((area, m))
+            if area > best_area_fb:
+                best_area_fb  = area
+                best_fallback = m
+        if acceptable:
+            return max(acceptable, key=lambda x: x[0])[1]
+        return best_fallback if best_fallback is not None else base
+
+    def _roi_seal_border_edges(self, mask):
+        """Seal contour where larva body genuinely exits the image border.
+        Requires >= 5% of edge length to be mask pixels to avoid sealing
+        on stray noise pixels (which creates a full-width bar)."""
+        from scipy import ndimage as _ndi
+        h, w   = mask.shape
+        sealed = mask.copy()
+        THRESH = 0.05
+        if np.sum(mask[0,   :] > 0) >= THRESH * w: sealed[0,   :] = 255
+        if np.sum(mask[h-1, :] > 0) >= THRESH * w: sealed[h-1, :] = 255
+        if np.sum(mask[:,   0] > 0) >= THRESH * h: sealed[:,   0] = 255
+        if np.sum(mask[:, w-1] > 0) >= THRESH * h: sealed[:, w-1] = 255
+        sealed = (_ndi.binary_fill_holes(sealed > 0).astype(np.uint8)) * 255
+        return sealed
 
     def detect_roi_from_threshold(self, frame, use_otsu=True, thresh_value=128,
                                    invert=False, min_size=500, max_size=100000,
@@ -1469,23 +1512,18 @@ class LarvaTurningAnalyzer(QMainWindow):
 
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-        # --- Primary: grey Otsu ---
-        base      = self._roi_base_otsu(gray)
-        best_mask = self._roi_best_mask_from_base(base)
-
-        if best_mask is not None and self._roi_convexity_ratio(best_mask) >= CONVEXITY_THRESHOLD:
-            mask = best_mask
-        else:
-            # --- Fallback 1: green channel ---
-            base_g = self._roi_base_otsu_green(img_bgr)
-            mask_g = self._roi_best_mask_from_base(base_g)
-            if mask_g is not None and self._roi_convexity_ratio(mask_g) >= CONVEXITY_THRESHOLD:
-                mask = mask_g
-            else:
-                # --- Fallback 2: convex hull ---
-                src_mask = best_mask if best_mask is not None else (
-                           mask_g   if mask_g   is not None else base)
-                mask = self._roi_convex_hull_mask(src_mask)
+        # --- Polarity-adaptive Otsu (no convexity gate — C-shapes have low convexity) ---
+        MAX_FILL = 0.40
+        best_mask = self._roi_best_mask_from_base(self._roi_base_otsu(img_bgr))
+        if best_mask is None or float(np.sum(best_mask > 0)) / best_mask.size > MAX_FILL:
+            # Fallback: green channel
+            best_mask = self._roi_best_mask_from_base(self._roi_base_otsu_green(img_bgr))
+        if best_mask is None or float(np.sum(best_mask > 0)) / best_mask.size > MAX_FILL:
+            # Last resort: convex hull
+            src_mask  = self._roi_base_otsu(img_bgr)
+            best_mask = self._roi_convex_hull_mask(src_mask)
+        mask = best_mask if best_mask is not None else self._roi_base_otsu(img_bgr)
+        mask = self._roi_seal_border_edges(mask)
 
         # Area filter
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
